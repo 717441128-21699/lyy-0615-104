@@ -16,6 +16,9 @@ export class SagaStep {
   private readonly checkStatusFn?: (
     context: SagaContext
   ) => Promise<OperationResult>;
+  private readonly checkCompensationStatusFn?: (
+    context: SagaContext
+  ) => Promise<OperationResult>;
   private readonly maxCompensationRetries: number;
   private readonly compensationRetryDelayMs: number;
   private readonly compensationRetryBackoffMultiplier: number;
@@ -35,6 +38,7 @@ export class SagaStep {
     this.executeFn = options.execute;
     this.compensateFn = options.compensate;
     this.checkStatusFn = options.checkStatus;
+    this.checkCompensationStatusFn = options.checkCompensationStatus;
     this.maxCompensationRetries = options.maxCompensationRetries ?? 5;
     this.compensationRetryDelayMs = options.compensationRetryDelayMs ?? 1000;
     this.compensationRetryBackoffMultiplier =
@@ -135,13 +139,7 @@ export class SagaStep {
 
     this.updateStepRecord(context, { status: StepStatus.SUSPENDED });
 
-    if (this.manualInterventionHandler) {
-      await this.manualInterventionHandler.onSuspended(
-        context.sagaId,
-        this.id,
-        context
-      );
-    }
+    let consecutiveUnknownCount = 0;
 
     for (let i = 0; i < this.maxStatusChecks; i++) {
       await this.delay(this.statusCheckIntervalMs);
@@ -166,18 +164,29 @@ export class SagaStep {
             });
             return StepStatus.FAILED;
           }
-          case OperationResult.UNKNOWN:
+          case OperationResult.UNKNOWN: {
+            consecutiveUnknownCount++;
             continue;
+          }
         }
       } catch (checkError) {
+        consecutiveUnknownCount++;
         continue;
       }
     }
 
     this.updateStepRecord(context, {
       status: StepStatus.NEEDS_MANUAL_INTERVENTION,
-      error: `Status check timed out after ${this.maxStatusChecks} attempts`,
+      error: `Status check timed out after ${this.maxStatusChecks} consecutive unknown results`,
     });
+
+    if (this.manualInterventionHandler) {
+      await this.manualInterventionHandler.onSuspended(
+        context.sagaId,
+        this.id,
+        context
+      );
+    }
 
     return StepStatus.NEEDS_MANUAL_INTERVENTION;
   }
@@ -200,6 +209,7 @@ export class SagaStep {
     this.updateStepRecord(context, { status: StepStatus.COMPENSATING });
 
     let lastError: Error | undefined;
+    let actuallyCompensated = false;
 
     for (
       let attempt = 0;
@@ -221,6 +231,30 @@ export class SagaStep {
       } catch (error) {
         lastError =
           error instanceof Error ? error : new Error(String(error));
+
+        if (this.checkCompensationStatusFn) {
+          try {
+            const compensationStatus = await this.checkCompensationStatusFn(
+              context
+            );
+
+            if (compensationStatus === OperationResult.SUCCESS) {
+              actuallyCompensated = true;
+              await this.idempotencyStore.set(
+                compensateKey,
+                'confirmed-by-status-check'
+              );
+              this.updateStepRecord(context, {
+                status: StepStatus.COMPENSATED,
+                compensationAttempts: attempt + 1,
+                lastCompensationAttempt: Date.now(),
+              });
+              return StepStatus.COMPENSATED;
+            }
+          } catch (_checkError) {
+            // 状态检查本身失败，继续重试逻辑
+          }
+        }
 
         this.updateStepRecord(context, {
           status: StepStatus.COMPENSATION_FAILED,

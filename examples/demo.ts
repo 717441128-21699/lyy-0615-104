@@ -316,12 +316,235 @@ async function demoCompensationFailure() {
   }
 }
 
+async function demoManualResolutionContinue() {
+  console.log('\n=== Demo 5: Manual Resolution - CONTINUE ===\n');
+  console.log('场景：步骤执行超时，状态检查一直不确定，人工判定成功，继续后续步骤');
+
+  const slowStep = {
+    id: 'slow-step',
+    name: 'Slow Operation',
+    execute: async (ctx: SagaContext) => {
+      console.log('  [Step] Starting slow operation (will timeout)...');
+      await new Promise((r) => setTimeout(r, 5000));
+      console.log('  [Step] Slow operation actually completed');
+      return 'slow-result';
+    },
+    compensate: async () => {
+      console.log('  [Compensate] Rolling back slow operation...');
+    },
+    checkStatus: async () => {
+      console.log('  [Status Check] Checking operation status... UNKNOWN');
+      return OperationResult.UNKNOWN;
+    },
+    executionTimeoutMs: 50,
+    statusCheckIntervalMs: 20,
+    maxStatusChecks: 3,
+  };
+
+  const saga = new SagaOrchestrator({
+    id: `manual-continue-demo-${Date.now()}`,
+    name: 'Manual Continue Demo',
+    idempotencyStore,
+    manualInterventionHandler: manualHandler,
+    steps: [
+      {
+        id: 'pre-step',
+        name: 'Pre Step',
+        execute: async () => {
+          console.log('  [Step] Pre-step executed');
+        },
+        compensate: async () => {
+          console.log('  [Compensate] Pre-step rolled back');
+        },
+      },
+      slowStep,
+      {
+        id: 'post-step',
+        name: 'Post Step',
+        execute: async () => {
+          console.log('  [Step] Post-step executed');
+        },
+        compensate: async () => {
+          console.log('  [Compensate] Post-step rolled back');
+        },
+      },
+    ],
+  });
+
+  console.log('\n--- Phase 1: Execute until suspended ---');
+  const initialStatus = await saga.execute();
+  console.log(`Saga status after execution: ${initialStatus}`);
+
+  const pendingTasks = manualHandler.getPendingTasks();
+  console.log(`Pending manual tasks: ${pendingTasks.length}`);
+  if (pendingTasks.length > 0) {
+    console.log(`  Task ID: ${pendingTasks[0].id}`);
+    console.log(`  Task type: ${pendingTasks[0].type}`);
+  }
+
+  console.log('\n--- Phase 2: Manual resolution - MARK AS COMPLETED ---');
+  console.log('  Operator decides: the operation actually succeeded.');
+  console.log('  Calling: saga.markStepCompleted("slow-step")');
+
+  const finalStatus = await saga.markStepCompleted('slow-step');
+  console.log(`\nFinal Saga Status: ${finalStatus}`);
+  console.log('Result: Saga completed successfully after manual resolution.');
+}
+
+async function demoManualResolutionCompensate() {
+  console.log('\n=== Demo 6: Manual Resolution - COMPENSATE ===\n');
+  console.log('场景：步骤执行超时，状态检查一直不确定，人工判定失败，触发补偿');
+
+  const slowStep = {
+    id: 'slow-step',
+    name: 'Slow Operation',
+    execute: async () => {
+      console.log('  [Step] Starting slow operation (will timeout)...');
+      await new Promise((r) => setTimeout(r, 5000));
+    },
+    compensate: async () => {
+      console.log('  [Compensate] Rolling back slow operation...');
+    },
+    checkStatus: async () => {
+      console.log('  [Status Check] Checking operation status... UNKNOWN');
+      return OperationResult.UNKNOWN;
+    },
+    executionTimeoutMs: 50,
+    statusCheckIntervalMs: 20,
+    maxStatusChecks: 3,
+  };
+
+  const saga = new SagaOrchestrator({
+    id: `manual-compensate-demo-${Date.now()}`,
+    name: 'Manual Compensate Demo',
+    idempotencyStore,
+    manualInterventionHandler: manualHandler,
+    steps: [
+      {
+        id: 'step-1',
+        name: 'Step 1',
+        execute: async () => {
+          console.log('  [Step] Step 1 executed');
+        },
+        compensate: async () => {
+          console.log('  [Compensate] Step 1 rolled back');
+        },
+      },
+      {
+        id: 'step-2',
+        name: 'Step 2',
+        execute: async () => {
+          console.log('  [Step] Step 2 executed');
+        },
+        compensate: async () => {
+          console.log('  [Compensate] Step 2 rolled back');
+        },
+      },
+      slowStep,
+    ],
+  });
+
+  console.log('\n--- Phase 1: Execute until suspended ---');
+  const initialStatus = await saga.execute();
+  console.log(`Saga status after execution: ${initialStatus}`);
+
+  console.log('\n--- Phase 2: Manual resolution - MARK AS FAILED ---');
+  console.log('  Operator decides: the operation actually failed.');
+  console.log('  Calling: saga.markStepFailed("slow-step")');
+
+  const finalStatus = await saga.markStepFailed('slow-step');
+  console.log(`\nFinal Saga Status: ${finalStatus}`);
+  console.log('Result: Saga rolled back (compensated) after manual resolution.');
+}
+
+async function demoManualResolutionRetry() {
+  console.log('\n=== Demo 7: Manual Resolution - RETRY ===\n');
+  console.log('场景：步骤执行超时，状态检查不确定，人工选择重试，重试成功');
+
+  let attemptCount = 0;
+
+  const flakyStep = {
+    id: 'flaky-step',
+    name: 'Flaky Operation',
+    execute: async () => {
+      attemptCount++;
+      console.log(`  [Step] Attempt ${attemptCount}: Starting operation...`);
+
+      if (attemptCount === 1) {
+        console.log('  [Step] First attempt: will timeout...');
+        await new Promise((r) => setTimeout(r, 5000));
+        return 'result';
+      } else {
+        console.log('  [Step] Retry attempt: succeeds quickly!');
+        return `result-attempt-${attemptCount}`;
+      }
+    },
+    compensate: async () => {
+      console.log('  [Compensate] Rolling back flaky operation...');
+    },
+    checkStatus: async () => {
+      console.log('  [Status Check] Status: UNKNOWN');
+      return OperationResult.UNKNOWN;
+    },
+    executionTimeoutMs: 50,
+    statusCheckIntervalMs: 20,
+    maxStatusChecks: 3,
+  };
+
+  const saga = new SagaOrchestrator({
+    id: `manual-retry-demo-${Date.now()}`,
+    name: 'Manual Retry Demo',
+    idempotencyStore,
+    manualInterventionHandler: manualHandler,
+    steps: [
+      {
+        id: 'step-1',
+        name: 'Step 1',
+        execute: async () => {
+          console.log('  [Step] Step 1 executed');
+        },
+        compensate: async () => {
+          console.log('  [Compensate] Step 1 rolled back');
+        },
+      },
+      flakyStep,
+      {
+        id: 'step-3',
+        name: 'Step 3',
+        execute: async () => {
+          console.log('  [Step] Step 3 executed');
+        },
+        compensate: async () => {
+          console.log('  [Compensate] Step 3 rolled back');
+        },
+      },
+    ],
+  });
+
+  console.log('\n--- Phase 1: Execute until suspended ---');
+  const initialStatus = await saga.execute();
+  console.log(`Saga status after execution: ${initialStatus}`);
+  console.log(`Attempt count so far: ${attemptCount}`);
+
+  console.log('\n--- Phase 2: Manual resolution - RETRY ---');
+  console.log('  Operator decides: let us retry the operation.');
+  console.log('  Calling: saga.retryStep("flaky-step")');
+
+  const finalStatus = await saga.retryStep('flaky-step');
+  console.log(`\nFinal Saga Status: ${finalStatus}`);
+  console.log(`Total attempts: ${attemptCount}`);
+  console.log('Result: Saga completed successfully after manual retry.');
+}
+
 async function runDemos() {
   try {
     await demoSuccessfulOrder();
     await demoFailedOrderWithCompensation();
     await demoNestedSaga();
     await demoCompensationFailure();
+    await demoManualResolutionContinue();
+    await demoManualResolutionCompensate();
+    await demoManualResolutionRetry();
 
     console.log('\n=== All demos completed ===\n');
   } catch (error) {

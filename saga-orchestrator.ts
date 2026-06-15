@@ -76,21 +76,12 @@ export class SagaOrchestrator {
 
         if (status === StepStatus.COMPLETED) {
           completedStepIds.push(step.id);
-        } else if (
-          status === StepStatus.FAILED ||
-          status === StepStatus.NEEDS_MANUAL_INTERVENTION
-        ) {
+        } else if (status === StepStatus.FAILED) {
           await this.compensate(completedStepIds);
-
-          if (status === StepStatus.NEEDS_MANUAL_INTERVENTION) {
-            const currentStatus = this.context.executionRecord
-              .status as SagaStatus;
-            if (currentStatus !== SagaStatus.COMPENSATION_FAILED) {
-              this.context.executionRecord.status = SagaStatus.SUSPENDED;
-            }
-          }
-
           return this.context.executionRecord.status;
+        } else if (status === StepStatus.NEEDS_MANUAL_INTERVENTION) {
+          this.context.executionRecord.status = SagaStatus.SUSPENDED;
+          return SagaStatus.SUSPENDED;
         } else if (status === StepStatus.SUSPENDED) {
           this.context.executionRecord.status = SagaStatus.SUSPENDED;
           return SagaStatus.SUSPENDED;
@@ -285,6 +276,139 @@ export class SagaOrchestrator {
   }
 
   getStatus(): SagaStatus {
+    return this.context.executionRecord.status;
+  }
+
+  async markStepCompleted(stepId: string): Promise<SagaStatus> {
+    const stepIndex = this.steps.findIndex((s) => s.id === stepId);
+    if (stepIndex === -1) {
+      throw new Error(`Step ${stepId} not found`);
+    }
+
+    const record = this.context.executionRecord.steps[stepIndex];
+    if (record.status !== StepStatus.SUSPENDED &&
+        record.status !== StepStatus.NEEDS_MANUAL_INTERVENTION &&
+        record.status !== StepStatus.EXECUTING) {
+      return this.context.executionRecord.status;
+    }
+
+    const executeKey = `saga:${this.id}:step:${stepId}:execute`;
+    await this.idempotencyStore.set(executeKey, 'manually-confirmed');
+
+    record.status = StepStatus.COMPLETED;
+    record.result = 'manually-confirmed';
+
+    return this.continueFromStep(stepIndex + 1);
+  }
+
+  async markStepFailed(stepId: string): Promise<SagaStatus> {
+    const stepIndex = this.steps.findIndex((s) => s.id === stepId);
+    if (stepIndex === -1) {
+      throw new Error(`Step ${stepId} not found`);
+    }
+
+    const record = this.context.executionRecord.steps[stepIndex];
+    if (record.status !== StepStatus.SUSPENDED &&
+        record.status !== StepStatus.NEEDS_MANUAL_INTERVENTION &&
+        record.status !== StepStatus.EXECUTING) {
+      return this.context.executionRecord.status;
+    }
+
+    record.status = StepStatus.FAILED;
+    record.error = 'Manually marked as failed';
+
+    const completedBefore = this.context.executionRecord.steps
+      .slice(0, stepIndex)
+      .filter((s) => s.status === StepStatus.COMPLETED)
+      .map((s) => s.stepId);
+
+    await this.compensate(completedBefore);
+    return this.context.executionRecord.status;
+  }
+
+  async retryStep(stepId: string): Promise<SagaStatus> {
+    const stepIndex = this.steps.findIndex((s) => s.id === stepId);
+    if (stepIndex === -1) {
+      throw new Error(`Step ${stepId} not found`);
+    }
+
+    const record = this.context.executionRecord.steps[stepIndex];
+    if (record.status !== StepStatus.SUSPENDED &&
+        record.status !== StepStatus.NEEDS_MANUAL_INTERVENTION &&
+        record.status !== StepStatus.COMPENSATION_FAILED) {
+      return this.context.executionRecord.status;
+    }
+
+    const step = this.steps[stepIndex];
+
+    if (record.status === StepStatus.COMPENSATION_FAILED) {
+      const status = await step.compensate(this.context);
+      if (status === StepStatus.COMPENSATED) {
+        const earlierStepIds = this.context.executionRecord.steps
+          .slice(0, stepIndex)
+          .filter((s) => s.status === StepStatus.COMPLETED)
+          .map((s) => s.stepId);
+
+        if (earlierStepIds.length > 0) {
+          await this.compensate(earlierStepIds);
+        } else {
+          this.context.executionRecord.status = SagaStatus.COMPENSATED;
+        }
+      } else {
+        this.context.executionRecord.status = SagaStatus.COMPENSATION_FAILED;
+      }
+      return this.context.executionRecord.status;
+    }
+
+    const completedBefore = this.context.executionRecord.steps
+      .slice(0, stepIndex)
+      .filter((s) => s.status === StepStatus.COMPLETED)
+      .map((s) => s.stepId);
+
+    const status = await step.execute(this.context);
+
+    if (status === StepStatus.COMPLETED) {
+      return this.continueFromStep(stepIndex + 1);
+    } else if (status === StepStatus.FAILED) {
+      await this.compensate(completedBefore);
+      return this.context.executionRecord.status;
+    } else if (status === StepStatus.NEEDS_MANUAL_INTERVENTION) {
+      this.context.executionRecord.status = SagaStatus.SUSPENDED;
+      return SagaStatus.SUSPENDED;
+    }
+
+    return this.context.executionRecord.status;
+  }
+
+  async markCompensationCompleted(stepId: string): Promise<SagaStatus> {
+    const stepIndex = this.steps.findIndex((s) => s.id === stepId);
+    if (stepIndex === -1) {
+      throw new Error(`Step ${stepId} not found`);
+    }
+
+    const record = this.context.executionRecord.steps[stepIndex];
+    if (record.status !== StepStatus.COMPENSATION_FAILED &&
+        record.status !== StepStatus.NEEDS_MANUAL_INTERVENTION &&
+        record.status !== StepStatus.COMPENSATING) {
+      return this.context.executionRecord.status;
+    }
+
+    const compensateKey = `saga:${this.id}:step:${stepId}:compensate`;
+    await this.idempotencyStore.set(compensateKey, 'manually-confirmed');
+
+    record.status = StepStatus.COMPENSATED;
+
+    const earlierStepIds = this.context.executionRecord.steps
+      .slice(0, stepIndex)
+      .filter((s) => s.status === StepStatus.COMPLETED)
+      .map((s) => s.stepId);
+
+    if (earlierStepIds.length > 0) {
+      await this.compensate(earlierStepIds);
+    } else {
+      this.context.executionRecord.status = SagaStatus.COMPENSATED;
+    }
+
     return this.context.executionRecord.status;
   }
 }

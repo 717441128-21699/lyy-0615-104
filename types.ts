@@ -13,7 +13,7 @@ export enum StepStatus {
 export enum SagaStatus {
   RUNNING = 'RUNNING',
   COMPLETED = 'COMPLETED',
-  FAILED = 'FAILD',
+  FAILED = 'FAILED',
   COMPENSATING = 'COMPENSATING',
   COMPENSATED = 'COMPENSATED',
   COMPENSATION_FAILED = 'COMPENSATION_FAILED',
@@ -83,6 +83,7 @@ export interface SagaStepOptions {
   execute: (context: SagaContext) => Promise<unknown>;
   compensate: (context: SagaContext) => Promise<unknown>;
   checkStatus?: (context: SagaContext) => Promise<OperationResult>;
+  checkCompensationStatus?: (context: SagaContext) => Promise<OperationResult>;
   maxCompensationRetries?: number;
   compensationRetryDelayMs?: number;
   compensationRetryBackoffMultiplier?: number;

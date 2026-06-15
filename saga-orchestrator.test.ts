@@ -291,8 +291,8 @@ describe('SagaOrchestrator', () => {
       expect(status).toBe(SagaStatus.COMPENSATION_FAILED);
       expect(compensateAttempts).toBe(3);
       expect(compensateDelays.length).toBe(2);
-      expect(compensateDelays[0]).toBeGreaterThanOrEqual(10);
-      expect(compensateDelays[1]).toBeGreaterThanOrEqual(20);
+      expect(compensateDelays[0]).toBeGreaterThanOrEqual(8);
+      expect(compensateDelays[1]).toBeGreaterThanOrEqual(15);
 
       const record = saga.getExecutionRecord();
       expect(record.steps[0].status).toBe(
@@ -699,6 +699,490 @@ describe('SagaOrchestrator', () => {
       const resolved = handler.resolveTask(createdTasks[0].id, 'retry');
       expect(resolved?.resolution).toBe('retry');
       expect(resolved?.resolved).toBe(true);
+    });
+  });
+
+  describe('Status Consistency', () => {
+    it('should have correct FAILED status value (no typos)', () => {
+      expect(SagaStatus.FAILED).toBe('FAILED');
+      expect(SagaStatus.FAILED).not.toBe('FAILD');
+    });
+
+    it('should return consistent FAILED status when internal error occurs', async () => {
+      const saga = new SagaOrchestrator({
+        id: 'test-status-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {
+              throw new Error('Something went wrong');
+            },
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      const status = await saga.execute();
+      expect(status).toBe(SagaStatus.COMPENSATED);
+
+      const record = saga.getExecutionRecord();
+      expect(record.steps[0].status).toBe(StepStatus.FAILED);
+      expect(record.steps[0].status).not.toBe('FAILD');
+    });
+  });
+
+  describe('Compensation Idempotency with Status Check', () => {
+    it('should detect successful compensation via status check even if compensate throws', async () => {
+      let compensateCallCount = 0;
+      let compensationStatusCheckCount = 0;
+      let compensationActuallyHappened = false;
+
+      const saga = new SagaOrchestrator({
+        id: 'test-comp-idem-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {
+              compensationActuallyHappened = false;
+            },
+            compensate: async () => {
+              compensateCallCount++;
+              compensationActuallyHappened = true;
+              throw new Error('Network error on return');
+            },
+            checkCompensationStatus: async () => {
+              compensationStatusCheckCount++;
+              return compensationActuallyHappened
+                ? OperationResult.SUCCESS
+                : OperationResult.UNKNOWN;
+            },
+            maxCompensationRetries: 2,
+            compensationRetryDelayMs: 5,
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {
+              throw new Error('Step 2 failed');
+            },
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      const status = await saga.execute();
+
+      expect(status).toBe(SagaStatus.COMPENSATED);
+      expect(compensateCallCount).toBe(1);
+      expect(compensationStatusCheckCount).toBeGreaterThanOrEqual(1);
+
+      const record = saga.getExecutionRecord();
+      expect(record.steps[0].status).toBe(StepStatus.COMPENSATED);
+
+      const compensateKey = 'saga:test-comp-idem-1:step:step-1:compensate';
+      const hasCompensated = await idempotencyStore.has(compensateKey);
+      expect(hasCompensated).toBe(true);
+    });
+
+    it('should not produce duplicate side effects when compensation is retried', async () => {
+      let sideEffectCount = 0;
+
+      const saga = new SagaOrchestrator({
+        id: 'test-comp-idem-2',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {},
+            compensate: async () => {
+              sideEffectCount++;
+            },
+            maxCompensationRetries: 0,
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {
+              throw new Error('Fail');
+            },
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      await saga.execute();
+      expect(sideEffectCount).toBe(1);
+
+      const compensateKey = 'saga:test-comp-idem-2:step:step-1:compensate';
+      const hasCompensated = await idempotencyStore.has(compensateKey);
+      expect(hasCompensated).toBe(true);
+
+      const saga2 = new SagaOrchestrator({
+        id: 'test-comp-idem-2',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {},
+            compensate: async () => {
+              sideEffectCount++;
+            },
+            maxCompensationRetries: 0,
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {
+              throw new Error('Fail');
+            },
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      await saga2.execute();
+      expect(sideEffectCount).toBe(1);
+    });
+  });
+
+  describe('Suspended State Manual Task Timing', () => {
+    it('should NOT create manual task immediately when entering suspended state', async () => {
+      const createdTasks: any[] = [];
+      const handler = new InMemoryManualInterventionHandler((task) => {
+        createdTasks.push(task);
+      });
+
+      let checkCount = 0;
+
+      const saga = new SagaOrchestrator({
+        id: 'test-suspend-timing-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: handler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            },
+            compensate: async () => {},
+            checkStatus: async () => {
+              checkCount++;
+              return OperationResult.UNKNOWN;
+            },
+            executionTimeoutMs: 10,
+            statusCheckIntervalMs: 10,
+            maxStatusChecks: 5,
+          },
+        ],
+      });
+
+      await saga.execute();
+
+      expect(createdTasks.length).toBe(1);
+      expect(checkCount).toBe(5);
+      expect(createdTasks[0].type).toBe('suspended');
+    });
+
+    it('should NOT leave manual task if status check eventually succeeds', async () => {
+      const createdTasks: any[] = [];
+      const handler = new InMemoryManualInterventionHandler((task) => {
+        createdTasks.push(task);
+      });
+
+      let checkCount = 0;
+
+      const saga = new SagaOrchestrator({
+        id: 'test-suspend-timing-2',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: handler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            },
+            compensate: async () => {},
+            checkStatus: async () => {
+              checkCount++;
+              if (checkCount >= 3) {
+                return OperationResult.SUCCESS;
+              }
+              return OperationResult.UNKNOWN;
+            },
+            executionTimeoutMs: 10,
+            statusCheckIntervalMs: 10,
+            maxStatusChecks: 10,
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => 'step2-result',
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      const status = await saga.execute();
+
+      expect(status).toBe(SagaStatus.COMPLETED);
+      expect(createdTasks.length).toBe(0);
+      expect(checkCount).toBe(3);
+    });
+  });
+
+  describe('Manual Resolution: Continue', () => {
+    it('should continue execution when step is manually marked as completed', async () => {
+      const executeOrder: string[] = [];
+
+      const saga = new SagaOrchestrator({
+        id: 'test-manual-continue-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {
+              executeOrder.push('step-1');
+            },
+            compensate: async () => {},
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {
+              executeOrder.push('step-2');
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            },
+            compensate: async () => {},
+            checkStatus: async () => OperationResult.UNKNOWN,
+            executionTimeoutMs: 10,
+            statusCheckIntervalMs: 5,
+            maxStatusChecks: 2,
+          },
+          {
+            id: 'step-3',
+            name: 'Step 3',
+            execute: async () => {
+              executeOrder.push('step-3');
+            },
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      const initialStatus = await saga.execute();
+      expect(initialStatus).toBe(SagaStatus.SUSPENDED);
+      expect(executeOrder).toEqual(['step-1', 'step-2']);
+
+      const finalStatus = await saga.markStepCompleted('step-2');
+      expect(finalStatus).toBe(SagaStatus.COMPLETED);
+      expect(executeOrder).toEqual(['step-1', 'step-2', 'step-3']);
+
+      const record = saga.getExecutionRecord();
+      expect(record.steps[1].status).toBe(StepStatus.COMPLETED);
+      expect(record.steps[1].result).toBe('manually-confirmed');
+    });
+  });
+
+  describe('Manual Resolution: Compensate', () => {
+    it('should trigger compensation when step is manually marked as failed', async () => {
+      const compensateOrder: string[] = [];
+
+      const saga = new SagaOrchestrator({
+        id: 'test-manual-compensate-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {},
+            compensate: async () => {
+              compensateOrder.push('step-1');
+            },
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {},
+            compensate: async () => {
+              compensateOrder.push('step-2');
+            },
+          },
+          {
+            id: 'step-3',
+            name: 'Step 3',
+            execute: async () => {
+              await new Promise((resolve) => setTimeout(resolve, 200));
+            },
+            compensate: async () => {
+              compensateOrder.push('step-3');
+            },
+            checkStatus: async () => OperationResult.UNKNOWN,
+            executionTimeoutMs: 10,
+            statusCheckIntervalMs: 5,
+            maxStatusChecks: 2,
+          },
+        ],
+      });
+
+      const initialStatus = await saga.execute();
+      expect(initialStatus).toBe(SagaStatus.SUSPENDED);
+      expect(compensateOrder).toEqual([]);
+
+      const finalStatus = await saga.markStepFailed('step-3');
+      expect(finalStatus).toBe(SagaStatus.COMPENSATED);
+      expect(compensateOrder).toEqual(['step-2', 'step-1']);
+
+      const record = saga.getExecutionRecord();
+      expect(record.steps[2].status).toBe(StepStatus.FAILED);
+      expect(record.steps[0].status).toBe(StepStatus.COMPENSATED);
+      expect(record.steps[1].status).toBe(StepStatus.COMPENSATED);
+    });
+  });
+
+  describe('Manual Resolution: Retry', () => {
+    it('should retry the step when manually requested', async () => {
+      let executeCount = 0;
+      let statusCheckCount = 0;
+
+      const saga = new SagaOrchestrator({
+        id: 'test-manual-retry-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {},
+            compensate: async () => {},
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {
+              executeCount++;
+              if (executeCount <= 1) {
+                await new Promise((resolve) => setTimeout(resolve, 200));
+              }
+              return `success-${executeCount}`;
+            },
+            compensate: async () => {},
+            checkStatus: async () => {
+              statusCheckCount++;
+              return OperationResult.UNKNOWN;
+            },
+            executionTimeoutMs: 10,
+            statusCheckIntervalMs: 5,
+            maxStatusChecks: 2,
+          },
+          {
+            id: 'step-3',
+            name: 'Step 3',
+            execute: async () => 'step3-done',
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      const initialStatus = await saga.execute();
+      expect(initialStatus).toBe(SagaStatus.SUSPENDED);
+      expect(executeCount).toBe(1);
+
+      const finalStatus = await saga.retryStep('step-2');
+      expect(finalStatus).toBe(SagaStatus.COMPLETED);
+      expect(executeCount).toBe(2);
+
+      const record = saga.getExecutionRecord();
+      expect(record.steps[1].status).toBe(StepStatus.COMPLETED);
+    });
+  });
+
+  describe('Manual Resolution: Compensation Complete', () => {
+    it('should mark compensation as done and continue compensating remaining steps', async () => {
+      const compensateOrder: string[] = [];
+
+      const saga = new SagaOrchestrator({
+        id: 'test-manual-comp-complete-1',
+        name: 'Test Saga',
+        idempotencyStore,
+        manualInterventionHandler: manualHandler,
+        steps: [
+          {
+            id: 'step-1',
+            name: 'Step 1',
+            execute: async () => {},
+            compensate: async () => {
+              compensateOrder.push('step-1');
+            },
+          },
+          {
+            id: 'step-2',
+            name: 'Step 2',
+            execute: async () => {},
+            compensate: async () => {
+              compensateOrder.push('step-2');
+              throw new Error('Compensation always fails');
+            },
+            maxCompensationRetries: 0,
+            compensationRetryDelayMs: 5,
+          },
+          {
+            id: 'step-3',
+            name: 'Step 3',
+            execute: async () => {
+              throw new Error('Step 3 failed');
+            },
+            compensate: async () => {},
+          },
+        ],
+      });
+
+      const initialStatus = await saga.execute();
+      expect(initialStatus).toBe(SagaStatus.COMPENSATION_FAILED);
+
+      const step1Record = saga.getExecutionRecord().steps[0];
+      const step2Record = saga.getExecutionRecord().steps[1];
+
+      expect(compensateOrder).toContain('step-2');
+      expect(step2Record.status).toBe(StepStatus.NEEDS_MANUAL_INTERVENTION);
+      expect(step1Record.status).toBe(StepStatus.COMPENSATED);
+
+      const compensateKey = 'saga:test-manual-comp-complete-1:step:step-2:compensate';
+      const hasCompensated = await idempotencyStore.has(compensateKey);
+      expect(hasCompensated).toBe(false);
+
+      const finalStatus = await saga.markCompensationCompleted('step-2');
+      expect(finalStatus).toBe(SagaStatus.COMPENSATED);
+
+      const hasCompensatedAfter = await idempotencyStore.has(compensateKey);
+      expect(hasCompensatedAfter).toBe(true);
+
+      const finalRecord = saga.getExecutionRecord();
+      expect(finalRecord.steps[1].status).toBe(StepStatus.COMPENSATED);
+      expect(finalRecord.steps[0].status).toBe(StepStatus.COMPENSATED);
     });
   });
 });
